@@ -41,6 +41,26 @@ class Run(Base):
     created_at: Mapped[datetime] = mapped_column(default=now)
     finished_at: Mapped[datetime | None]
 
+class OutageCheck(Base):
+    __tablename__ = 'outage_checks'
+    __table_args__ = (UniqueConstraint('snapshot_key', 'night', 'hotline', 'inspection'),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    snapshot_key: Mapped[str] = mapped_column(String(64), index=True)
+    night: Mapped[str] = mapped_column(String(40))
+    hotline: Mapped[int]
+    inspection: Mapped[int]
+    payload: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(default=now)
+
+class OutageSnapshot(Base):
+    __tablename__ = 'outage_snapshots'
+
+    run_id: Mapped[int] = mapped_column(ForeignKey('runs.id'), primary_key=True)
+    key: Mapped[str] = mapped_column(String(64), index=True)
+    snapshot: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(default=now)
+
 class Delivery(Base):
     __tablename__ = 'deliveries'
 

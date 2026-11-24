@@ -1,17 +1,21 @@
 import logging
+import time
 from datetime import date, timedelta
 from sqlalchemy import and_, or_, select
 from src.config.database import Session
 from src.constants.enums import Status
-from src.domain.analysis import analyze
+from src.domain import analysis, outage
 from src.domain.spec import SPEC
 from src.models.jobs import Delivery, Run, Schedule
 from src.models.source import Dataset
 from src.services.audit import record
+from src.services.outage import DatabaseCache, load_snapshot, save_snapshot
 from src.utils.exports import write_report
 from src.utils.time import now
 
 log = logging.getLogger(__name__)
+LEASE_SECONDS = 180
+WAIT_SECONDS = 150
 
 
 def materialize_due():
@@ -56,17 +60,65 @@ def claim():
             return None
         job.status = Status.RUNNING
         job.attempt += 1
-        job.lease_until = stamp + timedelta(minutes=3)
+        job.lease_until = stamp + timedelta(seconds=LEASE_SECONDS)
         records = db.get(Dataset, job.dataset_id).rows
-        return job.id, job.attempt, records, job.params
+        _, snapshot = load_snapshot(db, job.id)
+        return job.id, job.attempt, records, job.params, snapshot
+
+
+def _ensure_snapshot(job_id, attempt, rows):
+    """老运行没有开算快照时，按当前批次补建一次；已有快照则原样返回。"""
+    with Session.begin() as db:
+        job = db.get(Run, job_id, with_for_update=True)
+        if job.attempt != attempt or job.status != Status.RUNNING:
+            return None
+        _, snapshot = load_snapshot(db, job_id)
+        if snapshot is None:
+            snapshot = analysis.snapshot_for(rows)
+            save_snapshot(db, job_id, snapshot)
+        return snapshot
+
+
+def _renewer(job_id, attempt):
+    """按需延长租约，长时间枚举偏移组合时不被其他进程抢走。"""
+    last = [0.0]
+
+    def renew(done, total):
+        stamp = time.monotonic()
+        if stamp - last[0] < 20:
+            return
+        last[0] = stamp
+        with Session.begin() as db:
+            job = db.get(Run, job_id, with_for_update=True)
+            if job.attempt == attempt and job.status == Status.RUNNING:
+                job.lease_until = now() + timedelta(seconds=LEASE_SECONDS)
+
+    return renew
 
 
 def execute(lease):
-    job_id, attempt, rows, params = lease
+    job_id, attempt, rows, params, snapshot = lease
     result = export = failure = None
+    resumed = snapshot is not None
     try:
-        result = analyze(rows, params)
+        # 中断后恢复只用开算时保存的两路记录、范围和灯数，不再依赖批次重新聚合。
+        if snapshot is None:
+            snapshot = _ensure_snapshot(job_id, attempt, rows)
+        cache = DatabaseCache(snapshot) if outage.has_outage(snapshot) else None
+        result = analysis.analyze(rows, params, outage_cache=cache, snapshot=snapshot,
+                                  progress=_renewer(job_id, attempt), wait=WAIT_SECONDS)
         export = write_report(job_id, attempt, result)
+    except outage.Incomplete as error:
+        log.info('Analysis %s paused: %s', job_id, error)
+        # 并发接手时等待其他进程验完组合；本轮不计入中断次数，稍后重新领取。
+        with Session.begin() as db:
+            job = db.get(Run, job_id, with_for_update=True)
+            if job.attempt == attempt and job.status == Status.RUNNING:
+                job.status = Status.QUEUED
+                job.lease_until = None
+                job.attempt = max(0, attempt - 1)
+                record(db, 'worker', 'analysis.paused', job.id, attempt=attempt, reason=str(error)[:500])
+        return
     except ValueError as error:
         failure = str(error)[:500]
     except Exception:
@@ -82,7 +134,8 @@ def execute(lease):
         job.result = None if failure else result
         job.export_file = export
         job.error = failure
-        record(db, 'worker', f'analysis.{job.status}', job.id, attempt=attempt, reason=failure)
+        record(db, 'worker', f'analysis.{job.status}', job.id, attempt=attempt, reason=failure,
+               resumed=resumed)
         if job.schedule_id:
             plan = db.get(Schedule, job.schedule_id)
             ready = not failure and result.get('ready', True)

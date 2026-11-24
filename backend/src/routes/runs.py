@@ -6,12 +6,14 @@ from src.config.database import connection
 from src.config.settings import ARTIFACTS
 from src.constants.enums import Review, Role, Status
 from src.controllers.auth import allow, current
+from src.domain import analysis
 from src.domain.spec import SPEC
 from src.models.identity import User
 from src.models.jobs import Run
 from src.models.source import Dataset
 from src.schemas.requests import ReviewRequest, RunRequest
 from src.services.audit import record
+from src.services.outage import save_snapshot
 from src.services.validation import normalize_params
 from src.utils import views
 from src.utils.wakeup import wake
@@ -34,11 +36,16 @@ def index(db: Session = Depends(connection), actor: User = Depends(current)):
 @router.post('', status_code=202)
 def create(body: RunRequest, db: Session = Depends(connection),
            actor: User = Depends(allow(Role.ADMIN, Role.ANALYST))):
-    if not db.get(Dataset, body.dataset_id):
+    dataset = db.get(Dataset, body.dataset_id)
+    if not dataset:
         raise HTTPException(404, '找不到指定的数据批次')
-    item = Run(name=body.name, dataset_id=body.dataset_id, params=normalize_params(body.params), author=actor.username)
+    # 开算时固定两路记录、校时范围和灯数；中断恢复只认这份快照。
+    snapshot = analysis.snapshot_for(dataset.rows)
+    item = Run(name=body.name, dataset_id=body.dataset_id, params=normalize_params(body.params),
+               author=actor.username)
     db.add(item)
     db.flush()
+    save_snapshot(db, item.id, snapshot)
     record(db, actor.username, 'analysis.queued', item.id, dataset_id=item.dataset_id)
     db.commit()
     wake()

@@ -5,10 +5,11 @@ from datetime import date
 from fractions import Fraction
 from itertools import accumulate
 
+from . import outage
 from .spec import SPEC
 
 
-_REGISTER, _INCIDENT = SPEC["fields"][0]["options"]
+_REGISTER, _INCIDENT = SPEC["fields"][0]["options"][:2]
 _DISPATCH, _OBSERVE, _ARCHIVE = SPEC["modes"]
 _SITE_COLUMNS = (
     ("site_id", "灯组编号"), ("district", "片区"), ("site_name", "台账点位"),
@@ -37,7 +38,7 @@ def _blank(value):
 
 
 def validate_rows(rows):
-    """校验全量台账和工单，返回去除空字段的独立记录。"""
+    """校验全量台账、工单和夜间停灯记录，返回去除空字段的独立记录。"""
     if not isinstance(rows, (list, tuple)) or not rows:
         raise ValueError("灯组与工单明细为空，请导入灯组台账。")
 
@@ -49,6 +50,24 @@ def validate_rows(rows):
         if not isinstance(row, dict):
             raise ValueError(f"第 {index} 条记录格式有误。")
         kind = row.get("record_type")
+        if outage.is_outage_record(row):
+            if kind == outage.RANGE:
+                record = {
+                    "record_type": kind,
+                    "night": _text(row.get("night"), f"第 {index} 条校时范围的夜班"),
+                    "lane": row.get("lane"),
+                    "offset_min": row.get("offset_min"),
+                    "offset_max": row.get("offset_max"),
+                }
+            else:
+                record = {
+                    "record_type": kind,
+                    "night": _text(row.get("night"), f"第 {index} 条{kind}的夜班"),
+                    "site_id": _text(row.get("site_id"), f"第 {index} 条{kind}的灯组编号").upper(),
+                    "recorded_at": row.get("recorded_at"),
+                }
+            records.append(record)
+            continue
         site_id = _text(row.get("site_id"), f"第 {index} 条记录的灯组编号").upper()
         record = {"record_type": kind, "site_id": site_id}
         if kind == _REGISTER:
@@ -78,14 +97,19 @@ def validate_rows(rows):
             incident_ids.add(incident_id)
             incidents.append(record)
         else:
-            raise ValueError(f"第 {index} 条记录的记录类型须为「{_REGISTER}」或「{_INCIDENT}」。")
+            raise ValueError(f"第 {index} 条记录的记录类型须为「{_REGISTER}」或「{_INCIDENT}」或夜间停灯类型。")
         records.append(record)
 
     if not sites:
         raise ValueError("灯组台账为空，请为在册灯组提供台账行。")
+    for record in records:
+        if record["record_type"] in (outage.OFF, outage.ON) and record["site_id"] not in sites:
+            raise ValueError(f"{record['record_type']}的灯组「{record['site_id']}」没有台账行，请补录在册灯具数。")
     for incident in incidents:
         if incident["site_id"] not in sites:
             raise ValueError(f"工单「{incident['incident_id']}」未匹配灯组「{incident['site_id']}」，请补录或更正台账。")
+    if any(outage.is_outage_record(row) for row in records):
+        outage.build_snapshot(records)
     return records
 
 
@@ -151,7 +175,12 @@ def _triage(ranked, min_incidents, min_rate):
     return [site for _, site in sorted(queue)]
 
 
-def analyze(rows, normalized_params):
+def snapshot_for(rows):
+    """校验明细并返回开算快照（两路记录、校时范围和灯数）。"""
+    return outage.build_snapshot(validate_rows(rows))
+
+
+def analyze(rows, normalized_params, outage_cache=None, snapshot=None, progress=None, wait=0.0):
     records = validate_rows(rows)
     options = _parameters(normalized_params)
     district, start, end = (options[key] for key in ("district_scope", "start_date", "end_date"))
@@ -206,7 +235,7 @@ def analyze(rows, normalized_params):
     else:
         next_step = "本期无报修工单。按台账归档，并在下一周期复核新增工单。"
 
-    return {
+    result = {
         "state": "warning" if dispatch_count else "ok",
         "headline": f"{total} 张暗区工单分布在 {len(counts)}/{n} 个灯组，建议夜巡 {dispatch_count} 组。",
         "note": (f"{district or '全部片区'} · 报修起日 {start or '不限'} · 报修止日 {end or '不限'}。"
@@ -236,3 +265,10 @@ def analyze(rows, normalized_params):
         ],
         "sections": [{"title": "夜巡交接与复核", "text": next_step}],
     }
+    snapshot = snapshot or outage.build_snapshot(records)
+    if outage.has_outage(snapshot):
+        cache = outage_cache or outage.MemoryCache()
+        summary = outage.execute(snapshot, cache, progress=progress, wait=wait)
+        outage.merge(result, summary)
+        result["headline"] += outage.headline(summary)
+    return result
